@@ -1,0 +1,432 @@
+---
+title: "Predicting Yelp Star Ratings"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-02-05"
+---
+
+```{r setup, include=FALSE}
+require (jsonlite)
+require(dplyr)
+require(stringr)
+require(tidyverse)
+require(lubridate)
+require(ggplot2)
+require(magrittr)
+require(randomForest)
+require(rpart)
+require(ipred)
+require(caret)
+require(tidyr)
+require(viridis)
+require(scales)
+require(knitr)
+```
+```{r loading data, include=FALSE}
+setwd("C:/Users/u2105029/OneDrive - University of Warwick/Data Science")
+
+#Loading datasets
+business_data <- stream_in(file("yelp_academic_dataset_business.json")) 
+user_data <- stream_in(file("yelp_academic_dataset_user.json")) 
+tip_data  <- stream_in(file("yelp_academic_dataset_tip.json"))  
+load(file='yelp_review_small.rda')
+
+#Merge datasets (small reviews with full user datasets)
+userandreview <- merge (x= review_data_small, y= user_data, by= "user_id", all.x =TRUE)
+
+
+set.seed(1)
+merged_data_small1 <- sample_n (userandreview, size= 500000)
+business_condensed = subset(business_data, select = c(business_id, state, stars, review_count))
+business_review_user <- merge (x= merged_data_small1, y= business_condensed, by= "business_id", all.x =TRUE)
+
+na_count <- colSums(is.na(business_review_user))
+print (na_count)
+merged_na <- na.omit(business_review_user)
+
+#Converting variables so they are read correctly by R 
+#Stars to categorical
+merged_na$stars.x <- factor(merged_na$stars.x)
+
+
+
+```
+
+### NOTE: This markdown is slightly different from that of the PDF as many of the programs (sentiment analysis, random forest) are too computationally expensive so I have stopped those code chunks from running in this markdown (although still within the file but will not be knitted). Subsequently, some of the graphs will be missing so please refer to the PDF to view these.
+
+## Abstract
+
+In this project, I adopt a Random Forest supervised machine learning approach for Yelp review star rating prediction; I use a collection of user, review and business information and apply sentiment analysis to review text, finding that the most important prediction values are text sentiment, user average stars and average business stars. This model achieves an accuracy rate of 63.7% on a test dataset of 30,000 reviews.
+
+## Data Methodology
+I used the CRISP-DM to approach this particular project as this process felt the most intuitive and adoptable. The iterative nature of this approach allowed me to ensure all the steps were aligned with the overarching project objectives (business understanding) and the uniform structure held me accountable to stay on track. Of the 6 stages, the deployment phase as I did not use due to the absence of stakeholder engagement requirements. To illustrate my use of this framework, I will be structuring my report according to each of its stages.
+
+In the initial business understanding phase, I became familiarised with the objectives of the project and constructed a project plan, detailing a personal timeline, which ensured I completed the project in time.
+
+
+## Data Understanding
+Upon further exploration of the 5 provided Yelp datasets, the most relevant variables were identified in 3, which were then merged together: the Yelp Review dataset, Yelp User dataset and Yelp Business dataset. One of the difficulties in merging the data which became apparent was related to the randomness of the small review and user datasets, which meant users were inconsistent between the two and not all information could be matched. To circumvent this problem, the small reviews dataset was merged with the full user information dataset, which allowed all users (give number) to be captured. Subsequently, some variables, like average review stars, were taken from the business dataset and merged.
+
+Distribution of stars:
+```{r,echo=FALSE, warning=FALSE}
+percentage_data <- merged_na %>%
+  group_by(stars.x) %>%
+  summarise(percentage = n() / nrow(merged_na))
+
+ggplot(percentage_data, aes(x = factor(stars.x), y = percentage)) +
+  geom_bar(stat = "identity", fill = "#0073C2FF", color = "white", size = 0.7) +
+  geom_text(aes(label = scales::percent(percentage)),
+            position = position_stack(vjust = 0.5), color = "white", size = 3) +
+  labs(title = "Percentage Distribution of Stars",
+       x = "Stars",
+       y = "Percentage",
+       caption = "Data Source: Your Source") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.5), expand = c(0, 0)) +
+  theme_minimal() +
+  theme(legend.position = "none",       # Remove legend
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # Rotate x-axis labels
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center title
+        axis.title = element_text(size = 12, face = "bold"),
+        axis.text = element_text(size = 10),
+        plot.caption = element_text(size = 10, color = "gray"))
+```
+
+
+
+
+## Data Processing 
+Initial data processing involved omitting NA values from the newly constructed dataframe as very few of these values were found. Variable data types which had previously been wrongly classified (stars, state) were altered at this stage and the elite and friends variables were transformed into count variables, allowing them to be utilised within a model.
+
+```{r}
+#Elite as numerical
+merged_na1 <- merged_na %>%
+  mutate(elite = str_replace(elite, "20,20,2021", "2020,2021")) %>%
+  mutate(elite = str_replace(elite, "20,20 ", "2020")) %>%
+  mutate(elite = str_replace(elite, "20202021", "2020,2021")) %>%
+  mutate(elite = na_if(elite, "")) %>%
+  mutate(elite = ifelse(is.na(elite), 0, str_count(elite, ",") + 1)) %>%
+  mutate(elite= as.numeric(elite))
+
+#Friends as numerical
+merged_na1 <- merged_na1 %>%
+  mutate(friends = ifelse(friends == "None", 0, str_count(friends, ",") + 1))
+
+#State as caetgorical
+merged_na1$state <- factor(merged_na1$state)
+```
+
+
+A days_difference variable was also newly generated to replace and count the days between two variables: date review was posted and date the user created an account on Yelp.
+```{r, include=FALSE}
+
+merged_na2 <- merged_na1 %>%
+  mutate(
+    yelping_since = as.POSIXct(yelping_since, format = "%Y-%m-%d %H:%M:%S"),
+    date = as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S"),
+    days_difference = as.numeric(difftime(date, yelping_since, units = "days"))
+  )
+
+merged_na3 <- subset(merged_na2, select = -c(date, yelping_since,name))
+
+```
+
+To further understand the significance of these variables and whether they were relevant to star predictions, star distributions were examined against these potential predictors.
+
+
+
+```{r,echo=FALSE}
+percentage_data_state <- merged_na3 %>%
+  group_by(state, stars.x) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  group_by(state) %>%
+  mutate(percentage = count / sum(count))  
+
+ggplot(percentage_data_state, aes(x = stars.x, y = percentage)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_text(aes(label = scales::percent(percentage)),
+            position = position_stack(vjust = 0.5), color = "white") +
+  labs(title = "Percentage of each category in stars.x by State",
+       x = "Stars",
+       y = "Percentage") +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ state, scales = "free_y", ncol = 2) +  # Facet by state
+  theme_minimal()
+
+```
+
+
+```{r,echo=FALSE}
+merged_na3 %>%
+  group_by(stars.x) %>%
+  summarise(elite_count = sum(elite)) %>%
+  ggplot(aes(x = factor(stars.x), y = elite_count)) +
+  geom_bar(stat = "identity", fill = "#0073C2FF", color = "white", size = 0.7) +
+  geom_text(aes(label = elite_count),
+            position = position_stack(vjust = 0.5), color = "white", size = 3) +
+  labs(title = "Elite Status Distribution",
+       x = "Stars",
+       y = "Elite Count",
+       caption = "Data Source: Your Source") +
+  scale_y_continuous(labels = scales::comma_format(), limits = c(0, 250000), expand = c(0, 0)) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.title = element_text(size = 12, face = "bold"),
+        axis.text = element_text(size = 10),
+        plot.caption = element_text(size = 10, color = "gray"))
+```
+```{r,echo=FALSE}
+merged_na3 %>%
+  group_by(stars.x) %>%
+  summarise(friends_count = sum(friends)) %>%
+  ggplot(aes(x = factor(stars.x), y = friends_count, fill = factor(stars.x))) +
+  geom_bar(stat = "identity", fill = "#0073C2FF",color = "white", size = 0.7) +
+  geom_text(aes(label = friends_count),
+            position = position_stack(vjust = 0.5), color = "white", size = 3) +
+  labs(title = "Count of Friends by Star Category",
+       x = "Stars",
+       y= "Friend Count",
+       caption = "Data Source: Your Source") +
+  scale_y_continuous(labels = scales::comma_format(), limits = c(0, NA), expand = c(0, 0)) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.title = element_text(size = 12, face = "bold"),
+        axis.text = element_text(size = 10),
+        plot.caption = element_text(size = 10, color = "gray"))
+
+```
+
+
+At this stage, the significance of the 11 different compliment variables and the useful/funny/cool votes on the number of stars a review had was also uncertain. However, through visualisation of the data one can see that these variables can play some role in prediction:
+
+
+```{r, echo=FALSE}
+#To validate including useful, funny, cool votes in model - plotting how they are distributed between the star ratings
+merged_na3 %>%
+  group_by(stars.x) %>%
+  summarise(useful_count = sum(useful.x),
+            cool_count = sum(cool.x),
+            funny_count = sum(funny.x)) %>%
+  pivot_longer(cols = c("useful_count", "cool_count", "funny_count"), names_to = "category", values_to = "count") %>%
+  ggplot(aes(x = factor(stars.x), y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Stacked Bar Plot of Votes by Star Category",
+       x = "Stars",
+       y = "Count",
+       fill = "Category") +
+  theme_minimal()
+
+```
+```{r,echo=FALSE}
+#Stacked plot for all the compliments 
+merged_na3 %>%
+  group_by(stars.x) %>%
+  summarise(across(starts_with("compliment_"), sum)) %>%
+  pivot_longer(cols = starts_with("compliment_"), names_to = "category", values_to = "count") %>%
+  ggplot(aes(x = factor(stars.x), y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Compliments by Star Category",
+       x = "Stars",
+       y = "Count",
+       fill = "Compliment Category") +
+  theme_minimal()
+```
+
+
+## Sentiment Analysis
+The most valuable part of the preprocessing stage was determining a sentiment score for the review text. Many papers have explored the use of sentiment analysis in predicting Yelp reviews ((Elkouri, 2015); (Faisol et al., 2020) ; (Agrawal, 2017)), focusing solely on developing supervised learning models for star ratings based on the review text. Thus, it critical for this project to utilise this information in its’ prediction.
+This project uses the sentimentr package to provide an aggregate sentiment score for each review text. This package is able to calculate text polarity at the sentence level and from an extract by taking an average of the sentence sentiment scores to output an overall score and standard deviation.
+
+Crucially this package differs from others as it is able to account for negation and other valence shifters, like amplifiers, which are a common occurrence in reviews. As can be seen in the density graph below, the scores in this data are skewed slightly to the right and fall within a +1/-1 range.
+
+```{r, eval=FALSE}
+library(sentimentr)
+sentiment_1 <- merged_na3 %>%
+  get_sentences() %$%
+  sentiment_by(text, by = list(review_id))
+
+
+
+```
+```{r, include=FALSE, eval=FALSE}
+#Adding the sentiment scores to the merged dataframe
+merged_na5 <- merge (x= merged_na3, y=sentiment_1, by= c("review_id"), all.x= TRUE)
+#Remove sd value introduced by sentiment analysis
+merged_na6 = subset(merged_na5, select = -c(sd))
+#NA values found for days_difference removed
+merged_na6 <- na.omit(merged_na6)
+cleaned_data = subset(merged_na6, select = -c(review_id, user_id, business_id, user_id, word_count, text))
+
+
+```
+
+```{r, echo=FALSE, eval=FALSE}
+#Density Plot of Average Sentiment
+merged_na6 %>%
+  ggplot() +
+  geom_density(aes(x = ave_sentiment), fill = "#0073C2FF", color = "#1A1A1A", alpha = 0.7) +
+  labs(title = "Density Plot of Average Sentiment",
+       x = "Average Sentiment",
+       y= "Density")+
+  coord_cartesian(xlim = c(-1, 1)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "none"  # Remove legend
+  )
+```
+
+
+They correlate how one would expect with each of the star categories:
+
+
+
+```{r, echo=FALSE, eval=FALSE}
+#How the sentiment score is distributed for each of the star categories
+
+ggplot(merged_na6, aes(x = factor(stars.x), y = ave_sentiment, fill = factor(stars.x))) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(title = "Average Sentiment by Stars",
+       x = "Stars",
+       y = "Average Sentiment") +
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black", size = 0.5),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.background = element_rect(color = "black", fill = "white"),
+    legend.box.background = element_rect(color = "black", fill = "white")
+  ) +
+  scale_fill_manual(values = c("lightblue", "lightgreen", "lightcoral", "lightgoldenrodyellow", "lightpink"))
+```
+
+
+Had time permitted, this project would also have intended to account for the use of certain punctuation (ie. !) on the overall sentiment of the text.
+
+
+## Modelling + Evaluation
+To predict the number of stars user(i) gives for business(j), I have chosen to deploy a classification tree due to the categorical nature of stars. Specifically, I have used a random forest to reduce the high variance and tendency to overfit which regular decision trees are prone to. This is done through bootstrapping aggregation, where estimations are averaged over several independently drawn trees. Both bagging and random forest follow this methodology, however random forest has a distinct advantage in that it chooses random subsets of X for each tree, hence reducing the correlation between trees, which are a source of variation. 
+
+The final cleaned dataset contains 300,000 (randomly selected) reviews from the merged Yelp dataset and splits the observations, holding 90% as the training data set and 10% as the test. The dataset includes the Stars variable and 27 estimators, picked out in the pre-processing stage. Due to uncertainty as to which of the variables would be the best predictors, the random forest is run with all estimators. After carrying out some tuning of the number of trees and the number of variables to be considered at each split(mtry), the main predictive model used is a random forest classification with 1000 trees and mtry=6.
+
+```{r, include=FALSE, eval=FALSE}
+set.seed(1)
+cleaned_data_small<- sample_n(cleaned_data, size = 300000)
+
+#Splitting into training and test data with 90% allocated to training
+set.seed(1)
+n <- nrow(cleaned_data_small)
+train_indices <- sample(1:n, 0.9 * n, replace = FALSE) 
+train_data <- cleaned_data_small[train_indices, ]
+test_data <- cleaned_data_small[-train_indices, ]
+
+```
+```{r, eval=FALSE}
+set.seed(1)
+model_RF1000_6 <- randomForest(stars.x ~ ., data = train_data, ntree = 1000, mtry=6, importance=TRUE, do.trace = TRUE)
+save(model_RF1000_6, file= 'randomforest_1000_6')
+pred_RF_test1000_6 = predict(model_RF1000_6, test_data, do.trace = TRUE)
+#Accuracy on training data
+accuracytrain1000_6 <- sum(diag(model_RF1000_6$confusion)) / sum(model_RF1000_6$confusion)
+print(paste("Accuracy on Train Data:", round(accuracytrain1000_6, 4)))
+#Accuracy on test data
+conf_matrix1000_6 <- table(Actual = test_data$stars.x, Predicted = pred_RF_test1000_6)
+accuracy1000_6 <- sum(diag(conf_matrix1000_6)) / sum(conf_matrix1000_6)
+print(paste("Accuracy on Test Data:", round(accuracy1000_6, 4)))
+
+
+```
+
+The out-of-bag (OOB) error generated by each model was used to decide the number of trees and split variables considered. The OOB error is an unbiased estimator of model performance based on observations outside of the bootstrapped sample.
+The results are shown below:
+
+| Trees | OOB Error (%) |
+| :---: | :---: |
+| 100 | 37.23 |
+|500 | 36.44 |
+| 1000 | 36.25 |
+
+Increasing the number of trees to 1000 decreases the OOB error. Ideally one would choose ntrees where the OOB error starts to stabilise but this is too computationally expensive to determine so we will use ntree=1000. 
+
+The default mtry used is the square root of the number of variables used within the classification tree, which in this case would be 5. To find the optimal mtry, the range 3-7 was tested with ntree=100.
+
+```{r, eval=FALSE, echo=FALSE}
+#Trying to find the best mtry to use by testing that OOB error for 3-7
+oob.values <- rep(0, 5)
+
+# Fit models and collect OOB error rates
+for (i in 3:7) {
+  temp.model <- randomForest(stars.x ~ ., data = train_data, mtry = i, ntree = 100)
+  oob.values[i - 2] <- temp.model$err.rate[nrow(temp.model$err.rate), 1]
+}
+save(oob.values,file="oob_values.Rdata")
+
+plot(x = 3:7, y = oob.values, type = "b", 
+     xlab = "Number of Variables Tried at Each Split", ylab = "Out-of-Bag Error Rate",
+     main = "Optimal Number of Variables Tried At Each Split (mtry)",
+     col = "steelblue", pch = 16, bty = "n", ylim = c(0.372, 0.378), lwd = 2, cex.lab = 1.2, cex.axis = 1.2)
+grid()
+text(x = 3:7, y = oob.values, labels = round(oob.values, 5), pos = 3, col = "darkred", cex = 0.8)
+legend("topright", legend = "OOB Error", col = "steelblue", pch = 16, cex = 1.2)
+png("optimal_mtry.png", width = 800, height = 600, units = "px", res = 100)
+```
+
+
+
+The OOB error stabilises when mtry=6.This justifies running a random forest model with ntree=1000 and mtry=6.
+
+This RF model had an accuracy rate of 63.71%  on the training data and an OOB error of 36.29%. This is summarised below alongside other specifications ran: 
+
+```{r, results='asis', echo=FALSE}
+model_results <- data.frame(
+  Model = c("Main: Random Forest (ntree=1000, mtry=6)", "Random Forest (ntree=500, mtry=6)", "Random Forest (ntree=100, mtry=5)",
+            "Random Forest (ntree=500, mtry=5)", "Random Forest (ntree=1000, mtry=5)", "Bagging (ntree=500)"),
+  Training_Accuracy = c(63.71, 63.61, 62.77, 63.56, 63.75, NA),
+  Test_Accuracy = c(63.08, 63.05, 62.68, 62.80, 63.01, 55.7),
+  OOB = c(36.29, 36.39, 37.23, 36.44, 36.25, NA)
+)
+
+# Print the Markdown table
+cat("| Model | Training Accuracy | Test Accuracy | OOB |\n")
+cat("| --- | --- | --- | --- |\n")
+
+for (i in 1:nrow(model_results)) {
+  cat(paste("|", model_results[i, "Model"], "|", 
+            formatC(model_results[i, "Training_Accuracy"], digits = 4), "|",
+            formatC(model_results[i, "Test_Accuracy"], digits = 4), "|",
+            formatC(model_results[i, "OOB"], digits = 4), "|", "\n"))
+}
+
+```
+
+The main model outperforms the other variations and bagging on the test data accuracy.
+
+Upon further examination, it was possible to breakdown the importance of each of the variables. 
+
+```{r, eval=FALSE}
+varImpPlot(model_RF1000_6, type=1, main='Random Forest Variable Importance', cex.axis = 0.8)
+```
+
+This graph shows the decrease in mean accuracy which would be observed if each of the variables were removed from the model. It is evident that sentiment analysis is crucial to prediction and has been the key feature behind the robustness of this model.
+
+## Challenges
+The main challenge I encountered revolved around sentiment analysis, particularly in locating a suitable package to facilitate the analysis. In my research, I found sentiment analysis was commonly applied at an individual word level by using a pre-existing dictionary to assign individual scores and count frequencies. However, adapting this approach to assess sentiment at the sentence and extract levels – consistent with the format of reviews- posed a significant challenges when using existing packages, such as tidytext and vader. After trying these packages, I felt these methods to interpret sentiment would not be effective for multi-sentence reviews.I continued doing further research and was able to find the sentimentr package, which fit my needs.
+
+## References
+
+Agrawal, A., 2017. Yelp analytics (Doctoral dissertation, Rutgers University-Camden Graduate School).
+Elkouri, A., 2015. Predicting the sentiment polarity and rating of yelp reviews. arXiv preprint arXiv:1512.06303.
+Faisol, H., Djajadinata, K. and Muljono, M., 2020, September. Sentiment analysis of yelp review. In 2020 International seminar on application for technology of information and communication (iSemantic) (pp. 179-184). IEEE.
+
+
+Academic Integrity (warwick.ac.uk)
+
