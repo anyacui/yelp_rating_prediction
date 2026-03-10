@@ -16,6 +16,7 @@ Built a Random Forest classification model to predict Yelp star ratings using re
 - Sentiment score was the most important predictor by mean accuracy decrease
 
 ## Full Report
-[View full analysis here](https://anyacui.github.io/yelp_review_project/)
+[View full analysis here](https://anyacui.github.io/yelp_rating_prediction/)
+
 
 **Tools:** R, randomForest, sentimentr, ggplot2
